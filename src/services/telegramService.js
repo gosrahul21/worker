@@ -1,4 +1,4 @@
-const TelegramBot = require('node-telegram-bot-api');
+const { Telegraf } = require('telegraf');
 const config = require('../config');
 const redisService = require('./redisService');
 const notionService = require('./notionService');
@@ -28,7 +28,7 @@ function getControlPanelKeyboard(notificationsEnabled) {
   };
 }
 
-async function sendControlPanel(chatId) {
+async function sendControlPanel(ctx) {
   const isEnabled = await redisService.getNotificationsEnabled();
   const statusIcon = isEnabled ? '🟢 *Active*' : '🔴 *Paused*';
   
@@ -43,18 +43,18 @@ async function sendControlPanel(chatId) {
                `• /morning - Trigger Morning Briefing\n` +
                `• /evening - Trigger Evening Recap`;
 
-  return sendRawMessage(chatId, text, getControlPanelKeyboard(isEnabled));
+  return sendRawMessage(ctx.chat.id, text, getControlPanelKeyboard(isEnabled));
 }
 
 async function sendRawMessage(chatId, text, extraOptions = {}) {
-  if (bot) {
+  if (bot && bot.telegram) {
     try {
-      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...extraOptions });
+      await bot.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown', ...extraOptions });
       return true;
     } catch (err) {
       // Fallback without parse_mode if Markdown parsing failed
       try {
-        await bot.sendMessage(chatId, text, extraOptions);
+        await bot.telegram.sendMessage(chatId, text, extraOptions);
         return true;
       } catch (innerErr) {
         console.error('[TelegramService] Error sending Telegram message:', innerErr.message);
@@ -94,7 +94,7 @@ async function sendTelegramMessage(text, options = {}) {
 }
 
 /**
- * Initialize Telegram Bot with polling & interactive commands
+ * Initialize Telegram Bot with Telegraf
  */
 function initBot() {
   if (bot) return bot;
@@ -104,84 +104,100 @@ function initBot() {
     return null;
   }
 
-  console.log('[TelegramService] Initializing Telegram Bot in polling mode...');
-  bot = new TelegramBot(config.telegram.botToken, { polling: true });
+  console.log('[TelegramService] Initializing Telegram Bot (Telegraf)...');
+  bot = new Telegraf(config.telegram.botToken);
 
-  bot.on('polling_error', (err) => {
-    console.error('[TelegramService] Polling error:', err.message);
+  bot.catch((err, ctx) => {
+    console.error(`[TelegramService] Bot error for ${ctx.updateType}:`, err.message);
   });
 
   // /start & /help commands
-  bot.onText(/\/(start|help)/, async (msg) => {
-    await sendControlPanel(msg.chat.id);
+  bot.command(['start', 'help'], async (ctx) => {
+    await sendControlPanel(ctx);
   });
 
   // /stop & /pause commands
-  bot.onText(/\/(stop|pause)/, async (msg) => {
+  bot.command(['stop', 'pause'], async (ctx) => {
     await redisService.setNotificationsEnabled(false);
-    await sendRawMessage(msg.chat.id, `⏸️ *Notifications Paused*\n\nAll background email and Notion alerts are now paused.\nUse /resume or click below to resume.`, getControlPanelKeyboard(false));
+    await sendRawMessage(ctx.chat.id, `⏸️ *Notifications Paused*\n\nAll background email and Notion alerts are now paused.\nUse /resume or click below to resume.`, getControlPanelKeyboard(false));
   });
 
   // /resume & /start_notif commands
-  bot.onText(/\/(resume|start_notif)/, async (msg) => {
+  bot.command(['resume', 'start_notif'], async (ctx) => {
     await redisService.setNotificationsEnabled(true);
-    await sendRawMessage(msg.chat.id, `▶️ *Notifications Resumed*\n\nBackground email and Notion alerts are now active.\nUse /stop to pause anytime.`, getControlPanelKeyboard(true));
+    await sendRawMessage(ctx.chat.id, `▶️ *Notifications Resumed*\n\nBackground email and Notion alerts are now active.\nUse /stop to pause anytime.`, getControlPanelKeyboard(true));
   });
 
   // /notion & /status commands
-  bot.onText(/\/(notion|status)/, async (msg) => {
-    await handleNotionStatusCommand(msg.chat.id);
+  bot.command(['notion', 'status'], async (ctx) => {
+    await handleNotionStatusCommand(ctx.chat.id);
   });
 
   // /emails [hours] command
-  bot.onText(/\/emails(?:\s+(\d+))?/, async (msg, match) => {
-    const hours = match && match[1] ? parseInt(match[1], 10) : 1;
-    await handleCheckEmailsCommand(msg.chat.id, hours);
+  bot.command('emails', async (ctx) => {
+    const textParts = (ctx.message.text || '').trim().split(/\s+/);
+    const hours = textParts[1] ? parseInt(textParts[1], 10) : 1;
+    await handleCheckEmailsCommand(ctx.chat.id, isNaN(hours) ? 1 : hours);
   });
 
   // /morning command
-  bot.onText(/\/morning/, async (msg) => {
+  bot.command('morning', async (ctx) => {
     const notionScheduler = require('../worker/notionScheduler');
-    await sendRawMessage(msg.chat.id, '⏳ Triggering Morning Briefing...');
+    await sendRawMessage(ctx.chat.id, '⏳ Triggering Morning Briefing...');
     await notionScheduler.runMorningBriefing(true);
   });
 
   // /evening command
-  bot.onText(/\/evening/, async (msg) => {
+  bot.command('evening', async (ctx) => {
     const notionScheduler = require('../worker/notionScheduler');
-    await sendRawMessage(msg.chat.id, '⏳ Triggering Evening Recap...');
+    await sendRawMessage(ctx.chat.id, '⏳ Triggering Evening Recap...');
     await notionScheduler.runEveningRecap(true);
   });
 
-  // Inline Keyboard Button Click Handler
-  bot.on('callback_query', async (query) => {
-    const chatId = query.message.chat.id;
-    const action = query.data;
-
-    try {
-      await bot.answerCallbackQuery(query.id);
-    } catch (e) {}
-
-    if (action === 'cmd_notion') {
-      await handleNotionStatusCommand(chatId);
-    } else if (action === 'cmd_emails_1h') {
-      await handleCheckEmailsCommand(chatId, 1);
-    } else if (action === 'cmd_pause') {
-      await redisService.setNotificationsEnabled(false);
-      await sendRawMessage(chatId, `⏸️ *Notifications Paused*`, getControlPanelKeyboard(false));
-    } else if (action === 'cmd_resume') {
-      await redisService.setNotificationsEnabled(true);
-      await sendRawMessage(chatId, `▶️ *Notifications Resumed*`, getControlPanelKeyboard(true));
-    } else if (action === 'cmd_morning') {
-      const notionScheduler = require('../worker/notionScheduler');
-      await sendRawMessage(chatId, '⏳ Triggering Morning Briefing...');
-      await notionScheduler.runMorningBriefing(true);
-    } else if (action === 'cmd_evening') {
-      const notionScheduler = require('../worker/notionScheduler');
-      await sendRawMessage(chatId, '⏳ Triggering Evening Recap...');
-      await notionScheduler.runEveningRecap(true);
-    }
+  // Inline Keyboard Callback Actions
+  bot.action('cmd_notion', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await handleNotionStatusCommand(ctx.chat.id);
   });
+
+  bot.action('cmd_emails_1h', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await handleCheckEmailsCommand(ctx.chat.id, 1);
+  });
+
+  bot.action('cmd_pause', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await redisService.setNotificationsEnabled(false);
+    await sendRawMessage(ctx.chat.id, `⏸️ *Notifications Paused*`, getControlPanelKeyboard(false));
+  });
+
+  bot.action('cmd_resume', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await redisService.setNotificationsEnabled(true);
+    await sendRawMessage(ctx.chat.id, `▶️ *Notifications Resumed*`, getControlPanelKeyboard(true));
+  });
+
+  bot.action('cmd_morning', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const notionScheduler = require('../worker/notionScheduler');
+    await sendRawMessage(ctx.chat.id, '⏳ Triggering Morning Briefing...');
+    await notionScheduler.runMorningBriefing(true);
+  });
+
+  bot.action('cmd_evening', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const notionScheduler = require('../worker/notionScheduler');
+    await sendRawMessage(ctx.chat.id, '⏳ Triggering Evening Recap...');
+    await notionScheduler.runEveningRecap(true);
+  });
+
+  bot.launch().catch((err) => {
+    console.error('[TelegramService] Failed to launch bot polling:', err.message);
+  });
+
+  // Enable graceful stop
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
   return bot;
 }
