@@ -26,7 +26,7 @@ async function bootstrap() {
   });
 
   // Start Background Email Cron Worker
-  startScheduler();
+  // startScheduler();
 
   // Start Background Notion Task Worker
   startNotionWorker();
