@@ -21,6 +21,7 @@
     "imapflow": "^2.0.2",
     "ioredis": "^6.0.0",
     "mailparser": "^3.9.24",
-    "node-cron": "^4.6.0"
+    "node-cron": "^4.6.0",
+    "node-telegram-bot-api": "^2.1.0"
   }
 }

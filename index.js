@@ -1,6 +1,7 @@
 const app = require('./src/app');
 const config = require('./src/config');
 const redisService = require('./src/services/redisService');
+const telegramService = require('./src/services/telegramService');
 const { startScheduler, stopScheduler } = require('./src/worker/cronScheduler');
 const { startNotionWorker, stopNotionWorker } = require('./src/worker/notionScheduler');
 
@@ -13,6 +14,9 @@ async function bootstrap() {
 
   // Initialize Redis Connection
   await redisService.connectRedis();
+
+  // Initialize Interactive Telegram Bot Listener
+  telegramService.initBot();
 
   // Start HTTP Server for Health Checks
   server = app.listen(config.port, () => {

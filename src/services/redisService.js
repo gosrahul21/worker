@@ -174,6 +174,28 @@ async function setNotionLastEveningDate(dateStr) {
   }
 }
 
+async function getNotificationsEnabled() {
+  const client = getClient();
+  try {
+    const val = await client.get(config.redisKeys.notificationsEnabled);
+    if (val === null || val === undefined) return true; // Enabled by default
+    return val === 'true' || val === true || val === 1 || val === '1';
+  } catch (err) {
+    const fallback = inMemoryStore.get(config.redisKeys.notificationsEnabled);
+    return fallback !== undefined ? fallback : true;
+  }
+}
+
+async function setNotificationsEnabled(enabled) {
+  const client = getClient();
+  const valStr = String(Boolean(enabled));
+  try {
+    await client.set(config.redisKeys.notificationsEnabled, valStr);
+  } catch (err) {
+    inMemoryStore.set(config.redisKeys.notificationsEnabled, Boolean(enabled));
+  }
+}
+
 module.exports = {
   connectRedis,
   getLastProcessedTimestamp,
@@ -186,4 +208,6 @@ module.exports = {
   setNotionLastMorningDate,
   getNotionLastEveningDate,
   setNotionLastEveningDate,
+  getNotificationsEnabled,
+  setNotificationsEnabled,
 };

@@ -35,5 +35,6 @@ module.exports = {
     distributedLock: 'email_worker:lock',
     notionLastMorningDate: 'notion:last_morning_sent_date',
     notionLastEveningDate: 'notion:last_evening_sent_date',
+    notificationsEnabled: 'scheduler:notifications_enabled',
   },
 };
