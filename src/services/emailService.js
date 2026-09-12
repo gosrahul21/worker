@@ -1,5 +1,6 @@
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
+const { google } = require('googleapis');
 const config = require('../config');
 
 function stripHtml(html) {
@@ -19,9 +20,203 @@ function stripHtml(html) {
 }
 
 /**
+ * Connects to Gmail REST API using OAuth2 (Client ID, Client Secret, Refresh Token / Access Token)
+ * and fetches emails since fromTimestamp
+ */
+async function fetchEmailsSinceApi(fromTimestamp, toTimestamp = new Date()) {
+  const { clientId, clientSecret, refreshToken, accessToken } = config.gmail;
+  const startDate = fromTimestamp || new Date(Date.now() - 60 * 60 * 1000);
+
+  if (!clientId || !clientSecret || (!refreshToken && !accessToken)) {
+    console.log('[EmailService] Gmail API credentials incomplete in config. Falling back to IMAP service.');
+    return fetchEmailsSinceImap(startDate, toTimestamp);
+  }
+
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      clientId,
+      clientSecret,
+      'https://developers.google.com/oauthplayground'
+    );
+
+    oauth2Client.setCredentials({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    // Gmail API search query using epoch seconds
+    const afterEpochSec = Math.floor(startDate.getTime() / 1000);
+    const query = `after:${afterEpochSec}`;
+
+    console.log(`[EmailService] [REST API] Querying Gmail API for messages after ${startDate.toISOString()} (query: "${query}")...`);
+
+    let listRes = null;
+    let listRetries = 3;
+    let listDelay = 1000;
+
+    while (listRetries > 0) {
+      try {
+        listRes = await gmail.users.messages.list({
+          userId: 'me',
+          q: query,
+          maxResults: 50,
+        });
+        break;
+      } catch (err) {
+        if (err.status === 403 || err.status === 429 || (err.message && err.message.includes('Quota exceeded'))) {
+          listRetries--;
+          if (listRetries > 0) {
+            console.log(`[EmailService] [REST API] Quota rate limit hit. Waiting ${listDelay}ms before retry...`);
+            await new Promise((r) => setTimeout(r, listDelay));
+            listDelay *= 2;
+            continue;
+          }
+        }
+        throw err;
+      }
+    }
+
+    const messagesList = listRes?.data?.messages || [];
+    console.log(`[EmailService] [REST API] Found ${messagesList.length} message(s) in query response.`);
+
+    const fetchedEmails = [];
+
+    // Fetch message details in controlled chunks with retries to stay within Gmail API rate limits
+    const chunkSize = 5;
+    for (let i = 0; i < messagesList.length; i += chunkSize) {
+      const chunk = messagesList.slice(i, i + chunkSize);
+      const messageResults = await Promise.all(
+        chunk.map(async (msgRef) => {
+          let retries = 3;
+          let delay = 300;
+          while (retries > 0) {
+            try {
+              return await gmail.users.messages.get({
+                userId: 'me',
+                id: msgRef.id,
+                format: 'full',
+              });
+            } catch (err) {
+              if (err.status === 429 || (err.message && err.message.includes('Quota exceeded'))) {
+                retries--;
+                if (retries > 0) {
+                  await new Promise((r) => setTimeout(r, delay));
+                  delay *= 2;
+                  continue;
+                }
+              }
+              console.error(`[EmailService] Failed to fetch msg ${msgRef.id}:`, err.message);
+              return null;
+            }
+          }
+          return null;
+        })
+      );
+
+      for (const msgRes of messageResults) {
+        if (!msgRes || !msgRes.data) continue;
+        const msg = msgRes.data;
+        const headers = msg.payload?.headers || [];
+
+        const getHeader = (name) => {
+          const h = headers.find((item) => item.name.toLowerCase() === name.toLowerCase());
+          return h ? h.value : '';
+        };
+
+        const subject = getHeader('Subject') || '(No Subject)';
+        const sender = getHeader('From') || 'Unknown Sender';
+        const dateHeader = getHeader('Date');
+        const listUnsubscribe = getHeader('List-Unsubscribe');
+        const timestamp = dateHeader ? new Date(dateHeader) : (msg.internalDate ? new Date(parseInt(msg.internalDate, 10)) : new Date());
+
+        // Filter by timestamp window
+        if (timestamp <= startDate || timestamp > toTimestamp) {
+          continue;
+        }
+
+        // Extract plain text body or fallback to HTML / snippet
+        let rawBody = parseMessageBody(msg.payload);
+        if (!rawBody.trim() && msg.snippet) {
+          rawBody = msg.snippet;
+        }
+
+        // Categories from labelIds
+        const labelIds = msg.labelIds || [];
+        let category = 'primary';
+        const labelStr = labelIds.join(' ').toLowerCase();
+        if (labelStr.includes('category_promotions') || labelStr.includes('promotions')) category = 'promotions';
+        else if (labelStr.includes('category_social') || labelStr.includes('social')) category = 'social';
+        else if (labelStr.includes('category_updates') || labelStr.includes('updates')) category = 'updates';
+        else if (labelStr.includes('category_forums') || labelStr.includes('forums')) category = 'forums';
+
+        fetchedEmails.push({
+          id: msg.id,
+          threadId: msg.threadId,
+          subject,
+          sender,
+          body: rawBody.trim(),
+          timestamp,
+          type: category,
+          labelIds,
+          hasUnsubscribeHeader: Boolean(listUnsubscribe),
+          snippet: msg.snippet || '',
+        });
+      }
+    }
+
+    console.log(`[EmailService] [REST API] Successfully parsed ${fetchedEmails.length} messages.`);
+    return fetchedEmails;
+  } catch (err) {
+    console.error('[EmailService] [REST API] Error:', err.message);
+    if (err.response && err.response.data) {
+      console.error('[EmailService] API Error Detail:', JSON.stringify(err.response.data));
+    }
+    return [];
+  }
+}
+
+/**
+ * Helper to recursively extract text body from Gmail API payload
+ */
+function parseMessageBody(payload) {
+  if (!payload) return '';
+
+  let textBody = '';
+  let htmlBody = '';
+
+  function extractParts(part) {
+    if (!part) return;
+
+    if (part.mimeType === 'text/plain' && part.body && part.body.data) {
+      textBody += Buffer.from(part.body.data, 'base64url').toString('utf-8') + '\n';
+    } else if (part.mimeType === 'text/html' && part.body && part.body.data) {
+      htmlBody += Buffer.from(part.body.data, 'base64url').toString('utf-8') + '\n';
+    }
+
+    if (part.parts && Array.isArray(part.parts)) {
+      for (const subPart of part.parts) {
+        extractParts(subPart);
+      }
+    }
+  }
+
+  extractParts(payload);
+
+  if (textBody.trim()) {
+    return textBody;
+  } else if (htmlBody.trim()) {
+    return stripHtml(htmlBody);
+  }
+
+  return '';
+}
+
+/**
  * Connects to Gmail IMAP using App Password and fetches emails since fromTimestamp
  */
-async function fetchEmailsSince(fromTimestamp, toTimestamp = new Date()) {
+async function fetchEmailsSinceImap(fromTimestamp, toTimestamp = new Date()) {
   const { userEmail, appPassword } = config.gmail;
 
   const startDate = fromTimestamp || new Date(Date.now() - 60 * 60 * 1000);
@@ -67,6 +262,7 @@ async function fetchEmailsSince(fromTimestamp, toTimestamp = new Date()) {
           if (allLabelStr.includes('promotion') || allLabelStr.includes('category_promotions')) category = 'promotions';
           else if (allLabelStr.includes('social') || allLabelStr.includes('category_social')) category = 'social';
           else if (allLabelStr.includes('update') || allLabelStr.includes('category_updates')) category = 'updates';
+          else if (allLabelStr.includes('forum') || allLabelStr.includes('category_forums')) category = 'forums';
 
           // Extract plain text body or strip HTML body into clean text
           let rawBody = parsed.text || '';
@@ -105,54 +301,42 @@ async function fetchEmailsSince(fromTimestamp, toTimestamp = new Date()) {
 }
 
 /**
+ * Main router function: calls API or IMAP version based on GMAIL_FETCH_MODE
+ */
+async function fetchEmailsSince(fromTimestamp, toTimestamp = new Date()) {
+  const mode = (config.gmail.fetchMode || 'api').toLowerCase();
+
+  if (mode === 'imap') {
+    return fetchEmailsSinceImap(fromTimestamp, toTimestamp);
+  }
+
+  return fetchEmailsSinceApi(fromTimestamp, toTimestamp);
+}
+
+/**
  * Filter layer to identify important emails & exclude marketing, promotions, social, and updates.
  * Pure keyword and header-based filtration.
  */
 function filterImportantEmails(emails) {
   // Keywords indicating marketing / bulk promotional content
-  const promoKeywords = [
-    'credit card', 'personal loan', 'pre-approved', 'apply for', 'ipo',
-    'market volatility', 'special offer', 'discount', 'voucher', 'reward',
-    'newsletter', 'deal of the day', 'unsubscribe', 'cashback', 'exclusive deal',
-    'limited time offer', 'sale live', 'buy now', 'zero cost emi', 'flat % off',
-    'renew policy', 'claim your', 'refer & earn', 'refer and earn', 'opt out',
-    'opt-out', 'manage preferences', 'view in browser', 'view web version',
-    'shop now', 'order now', 'don\'t miss out', 'exclusive offer', 'free trial',
-    'investment opportunity', 'apply now', 'instant loan'
-  ];
-
-  // Common marketing / promotional sender patterns
-  const promoSenderPatterns = [
-    'info@', 'news@', 'mailer@', 'marketing@', 'digest@', 'newsletter@',
-    'retailproducts@', 'promotions@', 'updates@', 'no-reply@', 'noreply@',
-    'offers@', 'notifications@', 'bulletin@', 'deals@', 'sales@', 'alerts@',
-    'kotak', 'icici', 'hdfcbank', 'axisbank', 'amazon.in', 'flipkart'
-  ];
-
   const filtered = emails.filter((email) => {
     const subjectLower = (email.subject || '').toLowerCase();
     const senderLower = (email.sender || '').toLowerCase();
     const bodyLower = (email.body || '').toLowerCase();
 
-    // Rule 1: Exclude if body is missing or empty (< 10 characters)
-    if (!email.body || email.body.trim().length < 10) {
+    // Rule 1: Exclude non-primary categories (promotions, social, updates, forums)
+    const excludedCategories = ['promotions', 'social', 'updates', 'forums'];
+    if (excludedCategories.includes((email.type || '').toLowerCase())) {
       return false;
     }
 
-    // Rule 2: Exclude if email contains bulk unsubscribe header
-    if (email.hasUnsubscribeHeader) {
-      return false;
-    }
-
-    // Rule 3: Exclude if sender matches promotional patterns
-    const matchesPromoSender = promoSenderPatterns.some((pattern) => senderLower.includes(pattern));
-    if (matchesPromoSender) {
-      return false;
-    }
-
-    // Rule 4: Exclude if subject OR body contains marketing keywords
-    const matchesPromoKeyword = promoKeywords.some((kw) => subjectLower.includes(kw) || bodyLower.includes(kw));
-    if (matchesPromoKeyword) {
+    const labelStr = Array.isArray(email.labelIds) ? email.labelIds.join(' ').toLowerCase() : '';
+    if (
+      labelStr.includes('category_promotions') ||
+      labelStr.includes('category_social') ||
+      labelStr.includes('category_updates') ||
+      labelStr.includes('category_forums')
+    ) {
       return false;
     }
 
@@ -164,7 +348,7 @@ function filterImportantEmails(emails) {
 }
 
 /**
- * Mock fallback matching IMAP email object structure for local testing
+ * Mock fallback matching email object structure for local testing
  */
 function getMockGmailMessages(startDate, toTimestamp) {
   const mockEmails = [
@@ -199,5 +383,7 @@ function getMockGmailMessages(startDate, toTimestamp) {
 
 module.exports = {
   fetchEmailsSince,
+  fetchEmailsSinceApi,
+  fetchEmailsSinceImap,
   filterImportantEmails,
 };

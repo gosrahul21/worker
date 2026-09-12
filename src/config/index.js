@@ -10,6 +10,7 @@ module.exports = {
     password: process.env.REDIS_PASSWORD || undefined,
   },
   cronSchedule: process.env.CRON_SCHEDULE || '*/5 * * * *', // Default: every 5 minutes
+  timezone: process.env.TIMEZONE || 'Asia/Kolkata',
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
@@ -17,6 +18,11 @@ module.exports = {
   gmail: {
     userEmail: process.env.GMAIL_USER_EMAIL || '',
     appPassword: process.env.GMAIL_APP_PASSWORD || '',
+    fetchMode: process.env.GMAIL_FETCH_MODE || 'api', // 'api' or 'imap'
+    clientId: process.env.GMAIL_CLIENT_ID || '',
+    clientSecret: process.env.GMAIL_CLIENT_SECRET || '',
+    refreshToken: process.env.GMAIL_REFRESH_TOKEN || '',
+    accessToken: process.env.GMAIL_ACCESS_TOKEN || '',
   },
   notion: {
     apiKey: process.env.NOTION_API_KEY || '',

@@ -81,10 +81,10 @@ async function runSchedulerJob() {
 }
 
 function startScheduler() {
-  console.log(`[Scheduler] Initializing cron schedule: "${config.cronSchedule}"`);
+  console.log(`[Scheduler] Initializing cron schedule: "${config.cronSchedule}" (Timezone: ${config.timezone})`);
   scheduledTask = cron.schedule(config.cronSchedule, () => {
     runSchedulerJob();
-  });
+  }, { timezone: config.timezone });
 }
 
 function stopScheduler() {

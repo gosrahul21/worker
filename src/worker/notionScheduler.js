@@ -9,7 +9,18 @@ let eveningTask = null;
 let activeMonitorTask = null;
 
 function getTodayString() {
-  return new Date().toISOString().split('T')[0];
+  const tz = config.timezone || 'Asia/Kolkata';
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const year = parts.find((p) => p.type === 'year').value;
+  const month = parts.find((p) => p.type === 'month').value;
+  const day = parts.find((p) => p.type === 'day').value;
+  return `${year}-${month}-${day}`;
+}
+
+function getLocalHour() {
+  const tz = config.timezone || 'Asia/Kolkata';
+  const hourStr = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', hour12: false }).format(new Date());
+  return parseInt(hourStr, 10) % 24;
 }
 
 /**
@@ -26,7 +37,7 @@ async function runMorningBriefing(force = false) {
     }
   }
 
-  console.log(`\n[NotionWorker] Running Morning Briefing...`);
+  console.log(`\n[NotionWorker] Running Morning Briefing for date ${todayStr}...`);
   try {
     const tasks = await notionService.fetchAllTasks();
     const { pending, active } = notionService.categorizeTasks(tasks);
@@ -84,7 +95,7 @@ async function runEveningRecap(force = false) {
     }
   }
 
-  console.log(`\n[NotionWorker] Running Evening Recap...`);
+  console.log(`\n[NotionWorker] Running Evening Recap for date ${todayStr}...`);
   try {
     const tasks = await notionService.fetchAllTasks();
     const { pending, completedToday } = notionService.categorizeTasks(tasks);
@@ -124,16 +135,16 @@ async function runEveningRecap(force = false) {
  * ⏱️ 5-Minute Active Task Monitor (Working Hours)
  */
 async function runActiveTaskMonitor() {
-  const currentHour = new Date().getHours();
+  const currentHour = getLocalHour();
   const { workingHoursStart, workingHoursEnd } = config.notion;
 
   // Enforce user working hours window
   if (currentHour < workingHoursStart || currentHour >= workingHoursEnd) {
-    console.log(`[NotionWorker] Outside working hours (${workingHoursStart}:00 - ${workingHoursEnd}:00). Skipping 5-min check.`);
+    console.log(`[NotionWorker] Outside working hours (${workingHoursStart}:00 - ${workingHoursEnd}:00 in ${config.timezone}). Current hour: ${currentHour}. Skipping 5-min check.`);
     return;
   }
 
-  console.log(`[NotionWorker] Running 5-minute Active Task Monitor...`);
+  console.log(`[NotionWorker] Running 5-minute Active Task Monitor (Hour: ${currentHour} in ${config.timezone})...`);
   try {
     const tasks = await notionService.fetchAllTasks();
     const { pending, active } = notionService.categorizeTasks(tasks);
@@ -162,8 +173,7 @@ async function runActiveTaskMonitor() {
  * Catch-up check for Render / shared server restarts and external cron pings
  */
 async function checkAndRunPendingNotionJobs() {
-  const now = new Date();
-  const currentHour = now.getHours();
+  const currentHour = getLocalHour();
   const morningHour = config.notion.morningHour || 9;
   const eveningHour = config.notion.eveningHour || 23;
 
@@ -183,14 +193,16 @@ async function checkAndRunPendingNotionJobs() {
  * Start all Notion Cron Jobs
  */
 async function startNotionWorker() {
-  console.log(`[NotionWorker] Scheduling Morning Briefing (${config.notion.morningCron})`);
-  morningTask = cron.schedule(config.notion.morningCron, () => runMorningBriefing(false));
+  const tzOptions = { timezone: config.timezone || 'Asia/Kolkata' };
 
-  console.log(`[NotionWorker] Scheduling Evening Recap (${config.notion.eveningCron})`);
-  eveningTask = cron.schedule(config.notion.eveningCron, () => runEveningRecap(false));
+  console.log(`[NotionWorker] Scheduling Morning Briefing (${config.notion.morningCron}) [Timezone: ${tzOptions.timezone}]`);
+  morningTask = cron.schedule(config.notion.morningCron, () => runMorningBriefing(false), tzOptions);
 
-  console.log(`[NotionWorker] Scheduling Active Task Monitor (${config.notion.activeTaskCron})`);
-  activeMonitorTask = cron.schedule(config.notion.activeTaskCron, runActiveTaskMonitor);
+  console.log(`[NotionWorker] Scheduling Evening Recap (${config.notion.eveningCron}) [Timezone: ${tzOptions.timezone}]`);
+  eveningTask = cron.schedule(config.notion.eveningCron, () => runEveningRecap(false), tzOptions);
+
+  console.log(`[NotionWorker] Scheduling Active Task Monitor (${config.notion.activeTaskCron}) [Timezone: ${tzOptions.timezone}]`);
+  activeMonitorTask = cron.schedule(config.notion.activeTaskCron, runActiveTaskMonitor, tzOptions);
 
   // Catch-up check immediately on startup
   await checkAndRunPendingNotionJobs();
